@@ -485,6 +485,9 @@ int						live_tv_retries = 6;
 // Each pass runs BuildMasterCommList() in a forked copy of the process and writes <base>.master.edl.
 int						live_master_interval = 0;
 long					live_master_last_frame = 0;
+#if !defined(_WIN32)
+pid_t					live_master_child = 0;
+#endif
 int						dvrms_live_tv_retries = 300;
 int						standoff = 0;
 int						dvrmsstandoff = 120000;
@@ -3420,10 +3423,16 @@ int DetectCommercials(int f, double pts)
 #if !defined(_WIN32)
     if (live_tv && live_master_interval > 0 && frame_count - live_master_last_frame > live_master_interval * fps)
     {
+        // One analysis at a time: a child still running keeps the interval's turn
+        // until it has finished, so passes publish in order and never share the
+        // temporary file. Reaped here, so a finished child does not linger as a zombie.
+        if (live_master_child > 0 && waitpid(live_master_child, NULL, WNOHANG) == 0)
+            return 0;
+        live_master_child = 0;
         live_master_last_frame = frame_count;
-        while (waitpid(-1, NULL, WNOHANG) > 0) { }
         fflush(NULL);
-        if (fork() == 0)
+        live_master_child = fork();
+        if (live_master_child == 0)
         {
             // Child: BuildMasterCommList() reopens every output file from outbasename
             // (OpenOutputFiles), so give the child its own base name and publish the

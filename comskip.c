@@ -17,6 +17,11 @@
 #include "vo.h"
 #include <argtable2.h>
 #include <pthread.h>
+#if !defined(_WIN32)
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 
 #include <libavformat/avformat.h>
@@ -476,6 +481,13 @@ bool					live_tv = false;
 bool					output_incommercial = false;
 int						incommercial_frames = 1000;
 int						live_tv_retries = 6;
+// Seconds of content between full analyses in live_tv mode (0 = off). Each one writes
+// <base>.master.edl from a forked copy of the process; see StartLiveMasterPass().
+int						live_master_interval = 0;
+long					live_master_last_frame = 0;
+#if !defined(_WIN32)
+pid_t					live_master_child = 0;
+#endif
 int						dvrms_live_tv_retries = 300;
 int						standoff = 0;
 int						dvrmsstandoff = 120000;
@@ -915,9 +927,18 @@ bool				BuildBlocks(bool recalc);
 void				Recalc(void);
 double				ValidateBlackFrames(long reason, double ratio, int remove);
 int					DetectCommercials(int, double);
+bool				AnalyseFrames(void);
 bool				BuildMasterCommList(void);
+bool				WriteMasterEdl(char *path);
+#if !defined(_WIN32)
+void				StartLiveMasterPass(void);
+void				FinishLiveMasterPass(void);
+#endif
 void				WeighBlocks(void);
+double				ScoreThreshold(void);
+bool				BuildCommercialList(double threshold);
 bool				OutputBlocks(void);
+void				WriteEdlLine(FILE *f, long start, long end);
 void        OutputAspect(void);
 void        OutputTraining(void);
 bool ProcessLogoTest(int framenum_real, int curLogoTest, int close);
@@ -3408,6 +3429,10 @@ int DetectCommercials(int f, double pts)
     {
         BuildCommListAsYouGo();
     }
+#if !defined(_WIN32)
+    if (live_tv && live_master_interval > 0 && frame_count - live_master_last_frame > live_master_interval * fps)
+        StartLiveMasterPass();
+#endif
 
     return 0;
 }
@@ -3679,7 +3704,11 @@ void InsertBlackFrame(int f, int b, int u, int v, int c)
 
 
 
-bool BuildMasterCommList(void)
+// The analysis half of the end-of-recording pass: closes the open logo, aspect, audio
+// and caption blocks, finds the volume and logo thresholds and inserts the cut points
+// they imply. It writes no file, but it changes the detection state for good, so the
+// scan cannot carry on after it; WriteMasterEdl runs it in a copy of the process.
+bool AnalyseFrames(void)
 {
     int		i, j, t, c;
     int		a = 0,k,count = 0;
@@ -3701,9 +3730,6 @@ bool BuildMasterCommList(void)
 
     double	length;
     double	new_ar_ratio;
-    FILE*	logo_file = NULL;
-    bool	foundCommercials = false;
-    time_t	ltime;
 
     if (frame_count == 0)
     {
@@ -4615,6 +4641,21 @@ again:
         }
     }
 
+    return(true);
+}
+
+bool BuildMasterCommList(void)
+{
+    FILE*	logo_file = NULL;
+    bool	foundCommercials = false;
+    time_t	ltime;
+
+#if !defined(_WIN32)
+    FinishLiveMasterPass();
+#endif
+    if (!AnalyseFrames())
+        return(false);
+
     if (output_framearray) OutputFrameArray(false);
     if (output_framearray) OutputBlackArray();
 
@@ -4675,6 +4716,102 @@ again:
 //	free(frame);
     return (foundCommercials);
 }
+
+// The commercial list the end-of-recording pass would give for the frames decoded so
+// far, written to path as an EDL and nothing else: no other output file, no log
+// epilogue, no logo file removal. Like that pass it consumes the detection state.
+bool WriteMasterEdl(char *path)
+{
+    FILE*	f;
+    long	prev = -1;
+    long	start;
+    long	end;
+    int		i;
+
+    if (!AnalyseFrames())
+        return(false);
+    BuildBlocks(false);
+    WeighBlocks();	// PrintLogoFrameGroups is left out: it only feeds the log and the .tun file
+    BuildCommercialList(ScoreThreshold());
+
+    f = myfopen(path, "wb");
+    if (!f)
+    {
+        Debug(0, "live_master_interval: could not create %s: %s\n", path, strerror(errno));
+        return(false);
+    }
+    for (i = 0; i <= commercial_count; i++)
+    {
+        start = commercial[i].start_frame;
+        end = commercial[i].end_frame;
+        if (prev < start && end - start > 2)	// as OutputCommercialBlock filters <base>.edl
+            WriteEdlLine(f, start < 5 ? 0 : start, end);
+        prev = end;
+    }
+    return(fclose(f) == 0);
+}
+
+#if !defined(_WIN32)
+// live_master_interval: run WriteMasterEdl in a forked copy of the process, so the
+// analysis works on a snapshot of the frame data and the scan carries on with its own,
+// then publish <base>.master.edl by renaming the finished temporary file. The child
+// calls only the analysis and the file calls of WriteMasterEdl and leaves with _exit.
+// One pass at a time: while the previous child runs the interval keeps its turn, so
+// passes publish in order and never share the temporary file.
+void StartLiveMasterPass(void)
+{
+    pid_t	child;
+    int		status;
+
+    if (live_master_child > 0)
+    {
+        child = waitpid(live_master_child, &status, WNOHANG);
+        if (child == 0)
+            return;
+        if (child == live_master_child && !(WIFEXITED(status) && WEXITSTATUS(status) == 0))
+            Debug(1, "live_master_interval: the analysis at frame %ld failed\n", live_master_last_frame);
+        live_master_child = 0;
+    }
+    live_master_last_frame = frame_count;
+    fflush(NULL);	// so an exit() inside the analysis cannot write the parent's buffered output twice
+    child = fork();
+    if (child < 0)
+    {
+        Debug(1, "live_master_interval: fork failed: %s\n", strerror(errno));
+        return;
+    }
+    if (child == 0)
+    {
+        char	tmpname[MAX_PATH + 32];
+        char	finalname[MAX_PATH + 32];
+
+        verbose = 0;
+        output_training = 0;
+        snprintf(tmpname, sizeof(tmpname), "%s.master.tmp.edl", outbasename);
+        snprintf(finalname, sizeof(finalname), "%s.master.edl", outbasename);
+        if (WriteMasterEdl(tmpname) && rename(tmpname, finalname) == 0)
+            _exit(0);
+        myremove(tmpname);
+        _exit(1);
+    }
+    live_master_child = child;
+}
+
+// Called before the end-of-recording pass: wait for a periodic pass still running, so
+// it cannot publish <base>.master.edl after the final result, or after this process.
+void FinishLiveMasterPass(void)
+{
+    if (live_master_child <= 0)
+        return;
+    if (waitpid(live_master_child, NULL, WNOHANG) == 0)
+    {
+        Debug(1, "Waiting for the periodic analysis to finish\n");
+        while (waitpid(live_master_child, NULL, 0) < 0 && errno == EINTR)
+            ;
+    }
+    live_master_child = 0;
+}
+#endif
 
 bool WithinDivisibleTolerance(double test_number, double divisor, double tolerance)
 {
@@ -6786,6 +6923,22 @@ void OpenOutputFiles()
 
 #define CLOSEOUTFILE(F) { if ((F) && last) fclose(F); }
 
+// One <base>.edl entry for the frames start to end.
+void WriteEdlLine(FILE *f, long start, long end)
+{
+    int s_start = max(start-edl_offset,0);
+    int s_end = max(end - edl_offset,0);
+
+    if (demux_pid && enable_mencoder_pts)
+    {
+        fprintf(f, "%.2f\t%.2f\t%d\n", get_frame_pts(s_start) + F2T(1), get_frame_pts(s_end) + F2T(1), edl_skip_field);
+    }
+    else
+    {
+        fprintf(f, "%.2f\t%.2f\t%d\n", get_frame_pts(s_start), get_frame_pts(s_end), edl_skip_field);
+    }
+}
+
 void OutputCommercialBlock(int i, long prev, long start, long end, bool last)
 {
     int s_start, s_end;
@@ -6983,17 +7136,7 @@ void OutputCommercialBlock(int i, long prev, long start, long end, bool last)
     {
         if (start < 5)
             start = 0;
-        s_start = max(start-edl_offset,0);
-        s_end = max(end - edl_offset,0);
-
-        if (demux_pid && enable_mencoder_pts)
-        {
-            fprintf(edl_file, "%.2f\t%.2f\t%d\n", get_frame_pts(s_start) + F2T(1), get_frame_pts(s_end) + F2T(1), edl_skip_field);
-        }
-        else
-        {
-            fprintf(edl_file, "%.2f\t%.2f\t%d\n", get_frame_pts(s_start), get_frame_pts(s_end), edl_skip_field);
-        }
+        WriteEdlLine(edl_file, start, end);
     }
     CLOSEOUTFILE(edl_file);
 
@@ -7251,14 +7394,10 @@ void BuildCommercial()
 }
 
 
-bool OutputBlocks(void)
+// The rounded score above which a block counts as commercial.
+double ScoreThreshold(void)
 {
-    int		i,k;
-    long	prev;
-    double comlength;
     double	threshold;
-    bool	foundCommercials = false;
-    bool	deleted = false;
 
     if (global_threshold >= 0.0)
     {
@@ -7269,12 +7408,19 @@ bool OutputBlocks(void)
         threshold = FindScoreThreshold(score_percentile);
     }
 
-    OpenOutputFiles();
-
-
     Debug(1, "Threshold used - %.4f", threshold);
     threshold = ceil(threshold * 100) / 100.0;
     Debug(1, "\tAfter rounding - %.4f\n", threshold);
+    return(threshold);
+}
+
+// The commercial list from the weighed blocks: BuildCommercial, the heuristics that
+// extend, delete and trim breaks, and the padding. Writes no file. Returns whether a
+// heuristic deleted a break.
+bool BuildCommercialList(double threshold)
+{
+    int		i,k;
+    bool	deleted = false;
 
     BuildCommercial();
 
@@ -7636,7 +7782,21 @@ bool OutputBlocks(void)
         commercial[i].length += -2*padding + remove_before + remove_after;
     }
 
+    return(deleted);
+}
 
+bool OutputBlocks(void)
+{
+    int		i;
+    long	prev;
+    double comlength;
+    double	threshold;
+    bool	foundCommercials = false;
+    bool	deleted;
+
+    threshold = ScoreThreshold();
+    OpenOutputFiles();
+    deleted = BuildCommercialList(threshold);
 
     comlength = 0.;
     for (i = 0; i < commercial_count; i++)
@@ -7679,7 +7839,7 @@ bool OutputBlocks(void)
         }
     }
 
-    if (commercial[commercial_count].end_frame < frame_count-2)
+    if (commercial_count < 0 || commercial[commercial_count].end_frame < frame_count-2)
         OutputCommercialBlock(commercial_count+1, prev, frame_count-2, frame_count-1, true);
 
     if (output_videoredo)
@@ -8631,6 +8791,15 @@ void LoadIniFile()
         if ((tmp = FindNumber(data, "standoff_initial_wait=", (double) standoff_initial_wait)) > -1) standoff_initial_wait = (int) tmp;
 */
         if ((tmp = FindNumber(data, "live_tv_retries=", (double) live_tv_retries)) > -1) live_tv_retries = (int) tmp;
+        if ((tmp = FindNumber(data, "live_master_interval=", (double) live_master_interval)) > -1) live_master_interval = (int) tmp;
+#if defined(_WIN32)
+        if (live_master_interval > 0)
+        {
+            // The periodic analysis runs in a forked copy of the process.
+            Debug(0, "live_master_interval is not supported on Windows and is ignored\n");
+            live_master_interval = 0;
+        }
+#endif
 //        if ((tmp = FindNumber(data, "dvrms_live_tv_retries=", (double) dvrms_live_tv_retries)) > -1) dvrms_live_tv_retries = (int) tmp;
 //        if ((tmp = FindNumber(data, "standoff=", (double) standoff)) > -1) standoff = (int) tmp;
 //        if ((tmp = FindNumber(data, "dvrmsstandoff=", (double) dvrmsstandoff)) > -1) dvrmsstandoff = (int) tmp;

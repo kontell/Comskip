@@ -622,6 +622,7 @@ double				logo_fraction = 0.40;
 int					commDetectMethod = BLACK_FRAME + LOGO + RESOLUTION_CHANGE +  AR + SILENCE + (PROCESS_CC ? CC : 0);
 int					giveUpOnLogoSearch = 2000;			// If no logo is identified after x seconds into the show - give up.
 int					delay_logo_search = 0;			// If no logo is identified after x seconds into the show - give up.
+int					restart_logo_search = -1;		// Search for a new logo once the one found has been gone longer than a break can last, but only while it has been seen for under this many seconds in all: -1 always, 0 never.
 int				cut_on_ar_change = 1;
 int				cut_on_ac_change = 1;
 int					added_recording = 14;
@@ -3387,7 +3388,8 @@ int DetectCommercials(int f, double pts)
                 InitLogoBuffers();
                 newestLogoBuffer = -1;
             }
-            if (startOverAfterLogoInfoAvail && !loadingCSV && !secondLogoSearch && logo_block_count > 0 &&
+            if (startOverAfterLogoInfoAvail && (restart_logo_search < 0 || frames_with_logo < restart_logo_search * fps) &&
+                    !loadingCSV && !secondLogoSearch && logo_block_count > 0 &&
                     !lastLogoTest &&
                     F2L(frame_count,logo_block[logo_block_count-1].end) > ( max_commercialbreak * 1.2 ) &&
                     (double)frames_with_logo / (double)frame_count < 0.5
@@ -8743,6 +8745,7 @@ void LoadIniFile()
         if ((tmp = FindNumber(data, "border=", (double) border)) > -1) border = (int)tmp;
         if ((tmp = FindNumber(data, "give_up_logo_search=", (double) giveUpOnLogoSearch)) > -1) giveUpOnLogoSearch = (int)tmp;
         if ((tmp = FindNumber(data, "delay_logo_search=", (double) delay_logo_search)) > -1) delay_logo_search = (int)tmp;
+        if ((tmp = FindNumber(data, "restart_logo_search=", (double) restart_logo_search)) > -1) restart_logo_search = (int)tmp;
         if ((tmp = FindNumber(data, "logo_max_percentage_of_screen=", (double) logo_max_percentage_of_screen)) > -1) logo_max_percentage_of_screen = (double)tmp;
         if ((tmp = FindNumber(data, "ticker_tape=", (double) ticker_tape)) > -1) ticker_tape = (int)tmp;
         if ((tmp = FindNumber(data, "ticker_tape_percentage=", (double) ticker_tape_percentage)) > -1) ticker_tape_percentage = (int)tmp;

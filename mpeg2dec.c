@@ -40,6 +40,7 @@ double test_pts = 0.0;
 //#define restrict
 //#include <libavcodec/ac3dec.h>
 #include <libavutil/avutil.h>
+#include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/samplefmt.h>
 #include <libswscale/swscale.h>
@@ -322,8 +323,16 @@ extern bool output_smi;
 extern unsigned char *frame_ptr;
 extern int lastFrameWasSceneChange;
 extern int live_tv_retries;
+extern int live_tv_follow;
 extern int dvrms_live_tv_retries;
 int retries;
+// Set while the input is read in follow mode: a read at the end of the file waits
+// for more data, so the end of input means the file has stopped growing for good.
+static int following = 0;
+// How long a read may wait while the file is opened and probed, in microseconds.
+// Probing reads the tail of the file, and a file that has already stopped growing
+// should not hold that up for the whole live_tv_retries allowance.
+#define FOLLOW_OPEN_TIMEOUT 10000000LL
 
 //extern void set_fps(double frame_delay, double dfps, int ticks, double rfps, double afps);
 extern void set_fps(double frame_delay);
@@ -2009,6 +2018,36 @@ void file_open()
         is->pFormatCtx->max_analyze_duration *= 4;
 //        pFormatCtx->probesize = 400000;
 again:
+        following = 0;
+        if (live_tv && live_tv_follow)
+        {
+            // The file protocol's follow option turns "end of file" into "nothing
+            // yet": the demuxer never sees a half-written packet and nothing is
+            // reopened. Other protocols do not know the option and leave it in the
+            // dictionary, in which case the reopen-and-seek path below stays in use.
+            AVDictionary *open_options = NULL;
+            int opened;
+            av_dict_copy(&open_options, myoptions, 0);
+            av_dict_set(&open_options, "follow", "1", 0);
+            av_dict_set_int(&open_options, "rw_timeout", FOLLOW_OPEN_TIMEOUT, 0);
+            opened = avformat_open_input(&is->pFormatCtx, is->filename, NULL, &open_options);
+            following = (opened == 0 && av_dict_get(open_options, "follow", NULL, 0) == NULL);
+            av_dict_free(&open_options);
+            if (opened != 0)
+            {
+                is->pFormatCtx = NULL;
+                fprintf(stderr, "%s: Can not open file\n", is->filename);
+                if (openretries++ < live_tv_retries)
+                {
+                    Sleep(1000L);
+                    is->pFormatCtx = avformat_alloc_context();
+                    is->pFormatCtx->max_analyze_duration *= 4;
+                    goto again;
+                }
+                exit(-1);
+            }
+        }
+        else
         if(avformat_open_input(&is->pFormatCtx, is->filename, NULL,&myoptions)!=0)
         {
             fprintf(stderr, "%s: Can not open file\n", is->filename);
@@ -2036,6 +2075,16 @@ again:
         {
             fprintf(stderr, "%s: Can not find stream info\n", is->filename);
             exit(-1);
+        }
+        if (following)
+        {
+            // From here on a read waits as long as live_tv_retries would have kept
+            // reopening: 4 seconds a retry.
+            int64_t wait = (int64_t) (live_tv_retries > 0 ? live_tv_retries : 1) * 4000000LL;
+            if (av_opt_set_int(is->pFormatCtx->pb, "rw_timeout", wait, AV_OPT_SEARCH_CHILDREN) < 0)
+                Debug(1, "live_tv_follow: the wait at the end of the file stays at %d seconds\n", (int) (FOLLOW_OPEN_TIMEOUT / 1000000));
+            else
+                Debug(1, "live_tv_follow: waiting up to %d seconds at the end of the file\n", (int) (wait / 1000000));
         }
         // Dump information about file onto standard error
         if (retries == 0) av_dump_format(is->pFormatCtx, 0, is->filename, 0);
@@ -2450,7 +2499,7 @@ nextpacket:
                         }
                     }
 
-                    if ((live_tv && retries < live_tv_retries) /* || (selftest == 3 && retries == 0) */)
+                    if ((live_tv && !following && retries < live_tv_retries) /* || (selftest == 3 && retries == 0) */)
                     {
                         double frame_delay = av_q2d(is->dec_ctx->time_base) * is->dec_ctx->ticks_per_frame;
 //                    uint64_t retry_target;

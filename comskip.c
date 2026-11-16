@@ -481,6 +481,11 @@ bool					live_tv = false;
 bool					output_incommercial = false;
 int						incommercial_frames = 1000;
 int						live_tv_retries = 6;
+// In live_tv mode, wait at the end of the file for more data instead of closing,
+// reopening and seeking back (0 = off). The seek after a reopen is a guess at a
+// byte position; on a variable-bitrate transport stream it lands late often
+// enough to lose minutes of frames an hour. See file_open() in mpeg2dec.c.
+int						live_tv_follow = 0;
 // Seconds of content between full analyses in live_tv mode (0 = off). Each one writes
 // <base>.master.edl from a forked copy of the process; see StartLiveMasterPass().
 int						live_master_interval = 0;
@@ -8794,6 +8799,7 @@ void LoadIniFile()
         if ((tmp = FindNumber(data, "standoff_initial_wait=", (double) standoff_initial_wait)) > -1) standoff_initial_wait = (int) tmp;
 */
         if ((tmp = FindNumber(data, "live_tv_retries=", (double) live_tv_retries)) > -1) live_tv_retries = (int) tmp;
+        if ((tmp = FindNumber(data, "live_tv_follow=", (double) live_tv_follow)) > -1) live_tv_follow = (int) tmp;
         if ((tmp = FindNumber(data, "live_master_interval=", (double) live_master_interval)) > -1) live_master_interval = (int) tmp;
 #if defined(_WIN32)
         if (live_master_interval > 0)

@@ -489,6 +489,11 @@ int						live_tv_follow = 0;
 // Seconds of content between full analyses in live_tv mode (0 = off). Each one writes
 // <base>.master.edl from a forked copy of the process; see StartLiveMasterPass().
 int						live_master_interval = 0;
+// output_status: write <base>.status beside the result of the end-of-recording pass.
+// The periodic analyses of live_master_interval always write <base>.master.status.
+int						output_status = 0;
+// Whether the logo in use came from a logo file rather than this run's search.
+bool					logo_from_file = false;
 long					live_master_last_frame = 0;
 #if !defined(_WIN32)
 pid_t					live_master_child = 0;
@@ -936,6 +941,7 @@ int					DetectCommercials(int, double);
 bool				AnalyseFrames(void);
 bool				BuildMasterCommList(void);
 bool				WriteMasterEdl(char *path);
+bool				WriteAnalysisStatus(char *path);
 #if !defined(_WIN32)
 void				StartLiveMasterPass(void);
 void				FinishLiveMasterPass(void);
@@ -4710,6 +4716,14 @@ bool BuildMasterCommList(void)
         }
     }
 
+    if (output_status)
+    {
+        char	statusname[MAX_PATH + 32];
+
+        snprintf(statusname, sizeof(statusname), "%s.status", outbasename);
+        WriteAnalysisStatus(statusname);
+    }
+
     if (deleteLogoFile)
     {
         logo_file = myfopen(logofilename, "r");
@@ -4722,6 +4736,58 @@ bool BuildMasterCommList(void)
 
 //	free(frame);
     return (foundCommercials);
+}
+
+// The state of an analysis, written to path as key=value lines, for a caller that needs
+// more than the break list: how far the analysis read, whether it had a logo and where it
+// came from (none, found by this run's search, loaded from a logo file, or found and then
+// disabled for showing on too many or too few frames), the share of frames showing it,
+// the score threshold, and each break with its time span and score (the length-weighted
+// mean of its blocks' scores; above the threshold is commercial).
+bool WriteAnalysisStatus(char *path)
+{
+    FILE*	f;
+    long	prev = -1;
+    int		i;
+    int		b;
+    const char*	logo;
+
+    f = myfopen(path, "wb");
+    if (!f)
+    {
+        Debug(0, "Could not create %s: %s\n", path, strerror(errno));
+        return(false);
+    }
+    if (!logoInfoAvailable)
+        logo = "none";
+    else if (!(commDetectMethod & LOGO))
+        logo = "disabled";
+    else
+        logo = logo_from_file ? "loaded" : "found";
+    fprintf(f, "frames=%ld\n", frame_count);
+    fprintf(f, "seconds=%.2f\n", get_frame_pts(frame_count > 0 ? frame_count - 1 : 0));
+    fprintf(f, "logo=%s\n", logo);
+    fprintf(f, "logo_fraction=%.4f\n", logoPercentage);
+    fprintf(f, "threshold=%.3f\n", ScoreThreshold());
+    for (i = 0; i <= commercial_count; i++)
+    {
+        long	start = commercial[i].start_frame;
+        long	end = commercial[i].end_frame;
+        double	weighted = 0;
+        double	length = 0;
+
+        if (prev < start && end - start > 2)	// the breaks the EDL lists
+        {
+            for (b = commercial[i].start_block; b <= commercial[i].end_block; b++)
+            {
+                weighted += cblock[b].score * cblock[b].length;
+                length += cblock[b].length;
+            }
+            fprintf(f, "break=%.2f %.2f %.3f\n", get_frame_pts(start < 5 ? 0 : start), get_frame_pts(end), length > 0 ? weighted / length : 0);
+        }
+        prev = end;
+    }
+    return(fclose(f) == 0);
 }
 
 // The commercial list the end-of-recording pass would give for the frames decoded so
@@ -4794,10 +4860,17 @@ void StartLiveMasterPass(void)
 
         verbose = 0;
         output_training = 0;
+        char	statustmp[MAX_PATH + 32];
+        char	statusname[MAX_PATH + 32];
+
         snprintf(tmpname, sizeof(tmpname), "%s.master.tmp.edl", outbasename);
         snprintf(finalname, sizeof(finalname), "%s.master.edl", outbasename);
-        if (WriteMasterEdl(tmpname) && rename(tmpname, finalname) == 0)
+        snprintf(statustmp, sizeof(statustmp), "%s.master.tmp.status", outbasename);
+        snprintf(statusname, sizeof(statusname), "%s.master.status", outbasename);
+        // The status is published first, so whoever reads a new .master.edl finds its status.
+        if (WriteMasterEdl(tmpname) && WriteAnalysisStatus(statustmp) && rename(statustmp, statusname) == 0 && rename(tmpname, finalname) == 0)
             _exit(0);
+        myremove(statustmp);
         myremove(tmpname);
         _exit(1);
     }
@@ -8801,6 +8874,7 @@ void LoadIniFile()
         if ((tmp = FindNumber(data, "live_tv_retries=", (double) live_tv_retries)) > -1) live_tv_retries = (int) tmp;
         if ((tmp = FindNumber(data, "live_tv_follow=", (double) live_tv_follow)) > -1) live_tv_follow = (int) tmp;
         if ((tmp = FindNumber(data, "live_master_interval=", (double) live_master_interval)) > -1) live_master_interval = (int) tmp;
+        if ((tmp = FindNumber(data, "output_status=", (double) output_status)) > -1) output_status = (int) tmp;
 #if defined(_WIN32)
         if (live_master_interval > 0)
         {
@@ -12647,6 +12721,7 @@ void LoadLogoMaskData(void)
     if (logo_file)
     {
         Debug(1, "Using %s for logo data.\n", logofilename);
+        logo_from_file = true;
         len = fread(data, 1, 1999, logo_file);
         fclose(logo_file);
         data[len] = '\0';

@@ -9462,7 +9462,9 @@ FILE* LoadSettings(int argc, char ** argv)
 
     if (!loadingTXT)
     {
-        logo_file = myfopen(logofilename, "r+");
+        // Only read: a logo file the user cannot write (one kept for a channel and
+        // shared between runs, say) is still a logo file.
+        logo_file = myfopen(logofilename, "r");
         if (logo_file)
         {
             Debug(1, "The logo mask file exists.\n");

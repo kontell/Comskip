@@ -10549,7 +10549,9 @@ bool CheckSceneHasChanged(void)
     if (min_dimCount > dimCount * scale)
         min_dimCount = dimCount * scale;
 
-    if (cutsceneno != 0 || frame_count == cutsceneno)
+    // --dump=N: the one frame asked for. With || every frame was written over
+    // the last, so the file held the recording's last frame.
+    if (cutsceneno != 0 && frame_count == cutsceneno)
         RecordCutScene(frame_count, brightness);
 
 
